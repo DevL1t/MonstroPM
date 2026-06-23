@@ -5,7 +5,7 @@
 declare(strict_types=1);
 
 const APP_NAME    = 'Monstro Profile Manager';   # имя продукта — фиксированное, не настройка
-const APP_VERSION = '1.0.0';                     # версия — свойство кода, не конфига (меняется при релизе)
+const APP_VERSION = '1.2.0';                     # версия — свойство кода, не конфига (меняется при релизе)
 
 # Полифил array_is_list() для PHP 8.0
 if (!function_exists('array_is_list'))
@@ -179,7 +179,9 @@ function db(): PDO
         $pdo = new PDO($dsn, $d['user'] ?? '', $d['pass'] ?? '', [
             PDO::ATTR_ERRMODE            => PDO::ERRMODE_EXCEPTION,
             PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_PERSISTENT         => true,  # переиспользуем коннект (экономит ~700мс на запрос к удалённой БД)
+            # НЕ используем persistent: на общей с Monstro БД (лимит max_connections)
+            # постоянные коннекты висят в idle по воркерам FPM и выжирают слоты.
+            PDO::ATTR_PERSISTENT         => false,
         ]);
         $pdo->exec("SET search_path TO " . qi($d['schema'] ?? 'public'));
     }

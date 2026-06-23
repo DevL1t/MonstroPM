@@ -116,7 +116,7 @@ try{ FILT = JSON.parse(localStorage.getItem(FKEY)||'{}'); }catch(e){ FILT={}; }
 function saveFilt(){ localStorage.setItem(FKEY, JSON.stringify(FILT)); }
 function currentFilters(){
   const f={group:FILT.group||''};
-  ['f_platform','f_browser','f_device','f_age','f_activity'].forEach(k=>{ if(FILT[k]) f[k]=FILT[k]; });
+  ['f_platform','f_browser','f_device','f_age_min','f_age_max','f_dom_min','f_dom_max','f_grp_min','f_grp_max','f_activity'].forEach(k=>{ if(FILT[k]) f[k]=FILT[k]; });
   return f;
 }
 
@@ -125,9 +125,9 @@ function currentFilters(){
    =================================================================== */
 function initTable(){
   // одноразовый сброс старого сохранённого состояния колонок, чтобы применились новые дефолты
-  try{ if(!localStorage.getItem('monstro_state_v5')){
+  try{ if(!localStorage.getItem('monstro_state_v6')){
     Object.keys(localStorage).filter(k=>k.indexOf('DataTables_grid')>=0).forEach(k=>localStorage.removeItem(k));
-    localStorage.setItem('monstro_state_v5','1');
+    localStorage.setItem('monstro_state_v6','1');
   }}catch(e){}
 
   const hasSel = A.pk.length===1;   // колонка чекбоксов — только при одиночном PK
@@ -176,54 +176,115 @@ function initTable(){
   setupFilters(table);
   setupCrud(table);
   setupBulk(table);
+  setupExportImport(table);
 }
+
+/* выбранные строки — общий доступ для массовых действий и экспорта «выбранных» */
+const EXPORT = { selected: null };
 
 /* ---------------- массовые действия ---------------- */
 function setupBulk(table){
   if(!A.pk || A.pk.length!==1) return;       // только при одиночном PK
   const selected = new Set();
+  EXPORT.selected = selected;
   const bar  = document.getElementById('bulkbar');
   const cnt  = document.getElementById('bulkCount');
+  const allLink = document.getElementById('bulkAllLink');
   if(!bar) return;
 
-  const refreshBar=()=>{ if(cnt) cnt.textContent=selected.size; bar.classList.toggle('show', selected.size>0); };
-  // привести чекбоксы текущей страницы в соответствие набору + состояние «выбрать всё»
-  // (при scrollX главный чекбокс есть и в видимой, и в служебной копии шапки — обновляем все)
+  let total = 0;            // всего по текущему фильтру (recordsDisplay)
+  let allFiltered = false;  // режим «выбраны все по фильтру» (операция идёт scope=filter)
+
+  // сколько реально будет затронуто
+  const effCount = ()=> allFiltered ? total : selected.size;
+
+  const refreshBar=()=>{
+    if(cnt) cnt.textContent = effCount();
+    bar.classList.toggle('show', effCount()>0);
+    if(!allLink) return;
+    if(allFiltered){
+      allLink.style.display='';
+      allLink.className='bulk-alllink on';
+      allLink.textContent='✕ сбросить (выбрано все '+total+')';
+    } else {
+      const boxes=document.querySelectorAll('#grid tbody .selrow');
+      const on=[...boxes].filter(b=>b.checked).length;
+      const pageFull = boxes.length>0 && on===boxes.length;
+      // предлагаем «выбрать все по фильтру», только если за пределами страницы есть ещё
+      if(pageFull && total>selected.size){
+        allLink.style.display='';
+        allLink.className='bulk-alllink';
+        allLink.textContent='Выбрать все '+total+' по фильтру →';
+      } else { allLink.style.display='none'; }
+    }
+  };
+
+  // привести чекбоксы текущей страницы в соответствие состоянию
   const syncChecks=()=>{
     const boxes=document.querySelectorAll('#grid tbody .selrow');
-    boxes.forEach(b=>{ b.checked=selected.has(b.value); });
-    const total=boxes.length, on=[...boxes].filter(b=>b.checked).length;
+    boxes.forEach(b=>{ b.checked = allFiltered || selected.has(b.value); });
+    const tot=boxes.length, on=[...boxes].filter(b=>b.checked).length;
     document.querySelectorAll('.selall').forEach(all=>{
-      all.checked = total>0 && on===total; all.indeterminate = on>0 && on<total;
+      all.checked = tot>0 && on===tot;
+      all.indeterminate = !allFiltered && on>0 && on<tot;
     });
   };
-  table.on('draw', syncChecks);
 
-  // чекбокс строки
+  const clear=()=>{ selected.clear(); allFiltered=false; refreshBar(); syncChecks(); };
+
+  // на каждой перерисовке — обновить общее число и состояние
+  table.on('draw', ()=>{ total = table.page.info().recordsDisplay; syncChecks(); refreshBar(); });
+
+  // чекбокс строки: ручной клик выводит из режима «все по фильтру»
   $('#grid tbody').on('change','.selrow',function(){
-    if(this.checked) selected.add(this.value); else selected.delete(this.value);
+    if(allFiltered){
+      allFiltered=false; selected.clear();
+      document.querySelectorAll('#grid tbody .selrow').forEach(b=>{ if(b.checked) selected.add(b.value); });
+    } else {
+      if(this.checked) selected.add(this.value); else selected.delete(this.value);
+    }
     refreshBar(); syncChecks();
   });
-  // главный чекбокс — делегируем на document, т.к. при scrollX он в копии шапки вне #grid
+  // главный чекбокс страницы (в т.ч. копия шапки при scrollX)
   $(document).on('change','.selall',function(){
     const on=this.checked;
+    if(allFiltered && !on){ allFiltered=false; selected.clear(); }
     document.querySelectorAll('#grid tbody .selrow').forEach(b=>{
-      b.checked=on; if(on) selected.add(b.value); else selected.delete(b.value);
+      b.checked=on; if(on && !allFiltered) selected.add(b.value); else if(!on) selected.delete(b.value);
     });
     refreshBar(); syncChecks();
   });
 
-  const clear=()=>{ selected.clear(); refreshBar(); syncChecks(); };
+  // ссылка «выбрать все по фильтру» / «сбросить»
+  allLink&&allLink.addEventListener('click',e=>{
+    e.preventDefault();
+    if(allFiltered){ clear(); }
+    else { allFiltered=true; refreshBar(); syncChecks(); }
+  });
+
   const clearBtn=document.getElementById('bulkClear');
   clearBtn&&clearBtn.addEventListener('click',clear);
 
-  // подтверждение удаления
+  // дописать в FormData либо ids[], либо scope=filter + текущие фильтры
+  const appendScope=(fd)=>{
+    if(allFiltered){
+      fd.append('scope','filter');
+      const f=currentFilters();
+      Object.entries(f).forEach(([k,v])=>{ if(v!=='' && v!=null) fd.append(k,v); });
+    } else {
+      [...selected].forEach(v=>fd.append('ids[]',v));
+    }
+  };
+
+  // ---- подтверждение удаления ----
   const cm=document.getElementById('confirmModal');
   const ctext=document.getElementById('confirmText');
   const closeCm=()=>cm.classList.remove('open');
   document.getElementById('bulkDel').addEventListener('click',()=>{
-    if(!selected.size) return;
-    ctext.textContent='Удалить выбранные записи: '+selected.size+'? Действие необратимо.';
+    const n=effCount(); if(!n) return;
+    ctext.textContent = allFiltered
+      ? ('Удалить ВСЕ '+n+' профилей по текущему фильтру? Действие необратимо.')
+      : ('Удалить выбранные записи: '+n+'? Действие необратимо.');
     cm.classList.add('open'); refreshIcons();
   });
   document.getElementById('confirmNo').addEventListener('click',closeCm);
@@ -232,13 +293,12 @@ function setupBulk(table){
 
   const yes=document.getElementById('confirmYes');
   yes.addEventListener('click',()=>{
-    const ids=[...selected]; if(!ids.length) return;
-    const fd=new FormData(); fd.append('table',A.table);
-    ids.forEach(v=>fd.append('ids[]',v));
+    if(!effCount()) return;
+    const fd=new FormData(); fd.append('table',A.table); appendScope(fd);
     yes.disabled=true;
     fetch('api.php?action=delete_bulk&table='+enc(A.table),{method:'POST',body:fd})
       .then(r=>r.json()).then(res=>{
-        if(res.ok){ toast('Удалено: '+(res.deleted!=null?res.deleted:ids.length));
+        if(res.ok){ toast('Удалено: '+(res.deleted!=null?res.deleted:''));
           clear(); closeCm(); table.ajax.reload(null,false); reloadGroups(table); }
         else toast(res.error||'Ошибка',false);
       }).catch(e=>toast(String(e),false)).finally(()=>{ yes.disabled=false; });
@@ -249,7 +309,6 @@ function setupBulk(table){
   const gnew=document.getElementById('bulkGroupNew');
   const gapply=document.getElementById('bulkGroupApply');
   if(gsel){
-    // заполнить селект существующими группами + пункт «Создать группу…»
     const fillGroups=()=>fetch('api.php?action=groups&table='+enc(A.table)).then(r=>r.json()).then(rows=>{
       gsel.innerHTML='<option value="">— группа —</option>'+
         rows.filter(r=>r.g && r.g!=='__none__').map(r=>'<option value="'+esc(r.g)+'">'+esc(r.g)+'</option>').join('')+
@@ -261,19 +320,17 @@ function setupBulk(table){
       gnew.style.display=isNew?'':'none'; if(isNew) gnew.focus(); });
 
     gapply.addEventListener('click',()=>{
-      if(!selected.size){ toast('Ничего не выбрано',false); return; }
+      if(!effCount()){ toast('Ничего не выбрано',false); return; }
       let group;
       if(gsel.value==='__new__'){ group=(gnew.value||'').trim();
         if(!group){ toast('Введите название группы',false); gnew.focus(); return; } }
       else if(gsel.value===''){ toast('Выберите группу',false); return; }
       else group=gsel.value;
-      const ids=[...selected];
-      const fd=new FormData(); fd.append('table',A.table); fd.append('group',group);
-      ids.forEach(v=>fd.append('ids[]',v));
+      const fd=new FormData(); fd.append('table',A.table); fd.append('to_group',group); appendScope(fd);
       gapply.disabled=true;
       fetch('api.php?action=set_group_bulk&table='+enc(A.table),{method:'POST',body:fd})
         .then(r=>r.json()).then(res=>{
-          if(res.ok){ toast('Перенесено в «'+group+'»: '+(res.updated!=null?res.updated:ids.length));
+          if(res.ok){ toast('Перенесено в «'+group+'»: '+(res.updated!=null?res.updated:''));
             clear(); table.ajax.reload(null,false); reloadGroups(table); fillGroups(); }
           else toast(res.error||'Ошибка',false);
         }).catch(e=>toast(String(e),false)).finally(()=>{ gapply.disabled=false; });
@@ -285,10 +342,21 @@ function setupBulk(table){
 function setupFilters(table){
   if(!A.groupc) return;
   // restore selects
-  const map={f_platform:'fPlatform',f_browser:'fBrowser',f_device:'fDevice',f_age:'fAge',f_activity:'fActivity'};
+  const map={f_platform:'fPlatform',f_browser:'fBrowser',f_device:'fDevice',f_activity:'fActivity'};
   Object.entries(map).forEach(([k,id])=>{
     const el=document.getElementById(id); if(el && FILT[k]) el.value=FILT[k];
     el&&el.addEventListener('change',()=>{ FILT[k]=el.value; saveFilt(); table.ajax.reload(); });
+  });
+  // числовые диапазоны «от»/«до»: возраст (дни) и кол-во доменов
+  [['f_age_min','fAgeMin'],['f_age_max','fAgeMax'],['f_dom_min','fDomMin'],['f_dom_max','fDomMax'],['f_grp_min','fGrpMin'],['f_grp_max','fGrpMax']].forEach(([k,id])=>{
+    const el=document.getElementById(id); if(!el) return;
+    if(FILT[k]) el.value=FILT[k];
+    el.addEventListener('change',()=>{
+      const v=el.value.trim();
+      if(v==='' || isNaN(v)) { delete FILT[k]; el.value=''; } else FILT[k]=String(Math.max(0,parseInt(v,10)));
+      if(FILT[k]) el.value=FILT[k];
+      saveFilt(); table.ajax.reload();
+    });
   });
   // groups
   fetch('api.php?action=groups&table='+enc(A.table)).then(r=>r.json()).then(rows=>{
@@ -311,7 +379,7 @@ function setupFilters(table){
   // reset
   document.getElementById('resetF').addEventListener('click',()=>{
     FILT={}; saveFilt();
-    ['fPlatform','fBrowser','fDevice','fAge','fActivity'].forEach(id=>{const e=document.getElementById(id);if(e)e.value='';});
+    ['fPlatform','fBrowser','fDevice','fActivity','fAgeMin','fAgeMax','fDomMin','fDomMax','fGrpMin','fGrpMax'].forEach(id=>{const e=document.getElementById(id);if(e)e.value='';});
     syncChips(); table.ajax.reload();
   });
 }
@@ -324,6 +392,129 @@ function fillSel(id, items, ph){
 function syncChips(){
   document.querySelectorAll('#groupChips .chip').forEach(c=>
     c.classList.toggle('active',(c.dataset.g||'')===(FILT.group||'')));
+}
+
+/* ---------------- экспорт / импорт ---------------- */
+function dlBlob(blob, name){
+  const u=URL.createObjectURL(blob); const a=document.createElement('a');
+  a.href=u; a.download=name; document.body.appendChild(a); a.click();
+  setTimeout(()=>{ URL.revokeObjectURL(u); a.remove(); }, 1000);
+}
+function setupExportImport(table){
+  const expM=document.getElementById('exportModal'), impM=document.getElementById('importModal');
+  if(!expM||!impM) return;
+  const fmtSel=()=>expM.querySelector('input[name=exp_format]:checked').value;
+
+  // ----- экспорт -----
+  document.getElementById('exportBtn').addEventListener('click',()=>{
+    const n = EXPORT.selected ? EXPORT.selected.size : 0;
+    document.getElementById('expSelCnt').textContent = n ? '('+n+')' : '(нет выбранных)';
+    const idsR=expM.querySelector('input[value=ids]'); idsR.disabled=!n;
+    if(!n && idsR.checked) expM.querySelector('input[value=all]').checked=true;
+    expM.classList.add('open'); refreshIcons();
+  });
+  const closeExp=()=>expM.classList.remove('open');
+  document.getElementById('exportCancel').addEventListener('click',closeExp);
+  expM.addEventListener('click',e=>{ if(e.target===expM) closeExp(); });
+  document.getElementById('exportGo').addEventListener('click',()=>{
+    const fmt=fmtSel(), scope=expM.querySelector('input[name=exp_scope]:checked').value;
+    if(scope==='ids'){
+      const ids = EXPORT.selected ? [...EXPORT.selected] : [];
+      if(!ids.length){ toast('Ничего не выбрано',false); return; }
+      const fd=new FormData(); fd.append('format',fmt); fd.append('scope','ids');
+      ids.forEach(v=>fd.append('ids[]',v));
+      const go=document.getElementById('exportGo'); go.disabled=true;
+      fetch('api.php?action=export&table='+enc(A.table),{method:'POST',body:fd})
+        .then(r=>r.blob()).then(b=>{ dlBlob(b, A.table+'.'+fmt); closeExp(); })
+        .catch(e=>toast(String(e),false)).finally(()=>{ go.disabled=false; });
+    } else {
+      let url='api.php?action=export&table='+enc(A.table)+'&format='+fmt+'&scope='+scope;
+      if(scope==='filter') url+='&'+new URLSearchParams(currentFilters()).toString();
+      window.location=url; closeExp();
+    }
+  });
+
+  // ----- импорт -----
+  const impErr=document.getElementById('importErr');
+  const impProg=document.getElementById('importProg');
+  const impBar=document.getElementById('importBar');
+  const impPct=document.getElementById('importProgPct');
+  const impLbl=document.getElementById('importProgLbl');
+  const impFile=document.getElementById('importFile');
+  const impGo=document.getElementById('importGo');
+
+  // сброс всей индикации модалки в исходное
+  const impReset=()=>{
+    impErr.className='err'; impErr.textContent='';
+    impProg.classList.remove('show'); impBar.style.width='0%';
+    impGo.disabled=false; impGo.classList.remove('busy');
+  };
+  // показать прогресс с подписью и процентом (pct=null → неопределённый/обработка)
+  const impShow=(label,pct)=>{
+    impErr.className='err';
+    impProg.classList.add('show'); impLbl.textContent=label;
+    if(pct===null){ impProg.classList.add('indet'); impPct.textContent=''; impBar.style.width='100%'; }
+    else { impProg.classList.remove('indet'); impPct.textContent=Math.round(pct)+'%'; impBar.style.width=Math.round(pct)+'%'; }
+  };
+
+  document.getElementById('importBtn').addEventListener('click',()=>{
+    impReset(); impM.classList.add('open'); refreshIcons();
+  });
+  const closeImp=()=>impM.classList.remove('open');
+  document.getElementById('importCancel').addEventListener('click',closeImp);
+  impM.addEventListener('click',e=>{ if(e.target===impM) closeImp(); });
+  // выбрал новый файл — старая ошибка/прогресс больше не актуальны
+  impFile.addEventListener('change',impReset);
+
+  impGo.addEventListener('click',()=>{
+    const f=impFile.files[0];
+    if(!f){ impErr.textContent='Выберите CSV-файл'; impErr.className='err show'; return; }
+    const mode=impM.querySelector('input[name=imp_mode]:checked').value;
+    const fd=new FormData(); fd.append('file',f); fd.append('mode',mode);
+
+    impGo.disabled=true; impGo.classList.add('busy');
+    impShow('Загрузка файла…',0);
+
+    const xhr=new XMLHttpRequest();
+    xhr.open('POST','api.php?action=import&table='+enc(A.table));
+    // прогресс самой выгрузки файла на сервер
+    xhr.upload.onprogress=e=>{
+      if(e.lengthComputable){
+        const p=e.loaded/e.total*100;
+        impShow('Загрузка файла… '+fmtBytes(e.loaded)+' / '+fmtBytes(e.total),p);
+        // долил весь файл — дальше сервер парсит и пишет в БД
+        if(p>=100) impShow('Обработка на сервере…',null);
+      }
+    };
+    xhr.upload.onload=()=>impShow('Обработка на сервере…',null);
+    xhr.onload=()=>{
+      impGo.disabled=false; impGo.classList.remove('busy');
+      let res; try{ res=JSON.parse(xhr.responseText); }catch(_){ res=null; }
+      if(xhr.status===200 && res && res.ok){
+        impProg.classList.remove('show');
+        toast('Импорт: добавлено '+res.imported+', пропущено '+res.skipped+(res.bad?', без PID '+res.bad:''));
+        closeImp(); table.ajax.reload(null,false); reloadGroups(table);
+      } else {
+        impProg.classList.remove('show');
+        const msg=(res&&res.error) ? res.error : ('Ошибка сервера ('+xhr.status+')');
+        impErr.textContent=msg; impErr.className='err show';
+      }
+    };
+    xhr.onerror=()=>{
+      impGo.disabled=false; impGo.classList.remove('busy');
+      impProg.classList.remove('show');
+      impErr.textContent='Сбой сети при загрузке'; impErr.className='err show';
+    };
+    xhr.send(fd);
+  });
+}
+
+// Человекочитаемый размер
+function fmtBytes(n){
+  if(n<1024) return n+' Б';
+  if(n<1048576) return (n/1024).toFixed(0)+' КБ';
+  if(n<1073741824) return (n/1048576).toFixed(1)+' МБ';
+  return (n/1073741824).toFixed(2)+' ГБ';
 }
 
 /* ---------------- CRUD ---------------- */
@@ -588,6 +779,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
   if(A.dbErr && A.page!=='settings') return;   // БД недоступна — показана карточка ошибки, инициализировать нечего
   if(A.page==='dashboard') initDashboard();
   else if(A.page==='settings') initSettings();
+  else if(A.page==='rules') initRules();
   else initTable();
 });
 
@@ -605,4 +797,265 @@ function initSettings(){
       }).catch(e=>{ err.textContent=String(e); err.className='err show'; })
       .finally(()=>{ btn.disabled=false; });
   });
+
+  // включение/отключение отслеживания времени в группе (миграция party_since)
+  const gt=document.getElementById('gtrackToggle');
+  if(gt){
+    gt.addEventListener('click',()=>{
+      const wrap=document.getElementById('gtrack');
+      const on=wrap.dataset.enabled==='1';
+      const err=document.getElementById('gtrackErr'); err.className='err';
+      if(on && !confirm('Отключить отслеживание? Будут удалены триггер, функция и колонка party_since (история времени в группе сбросится).')) return;
+      gt.disabled=true; gt.classList.add('busy');
+      const act=on?'gtrack_disable':'gtrack_enable';
+      fetch('api.php?action='+act+'&table='+enc(A.table),{method:'POST',body:new FormData()})
+        .then(r=>r.json()).then(res=>{
+          if(res.ok){ toast(on?'Отслеживание отключено':'Отслеживание включено'); setTimeout(()=>location.reload(),600); }
+          else { err.textContent=res.error||'Ошибка'; err.className='err show'; gt.disabled=false; gt.classList.remove('busy'); }
+        }).catch(e=>{ err.textContent=String(e); err.className='err show'; gt.disabled=false; gt.classList.remove('busy'); });
+    });
+  }
+}
+
+/* ---------------- планировщик ---------------- */
+function initRules(){
+  const listEl=document.getElementById('rulesList');
+  const modal=document.getElementById('ruleModal');
+  if(!listEl||!modal) return;
+  let groups=[], rulesCache=[];
+
+  const F={ id:'ruleId',name:'ruleName',from:'ruleFrom',to:'ruleTo',toNew:'ruleToNew',
+            ageMin:'ruleAgeMin',ageMax:'ruleAgeMax',domMin:'ruleDomMin',domMax:'ruleDomMax',
+            grpMin:'ruleGrpMin',grpMax:'ruleGrpMax',
+            ageOn:'ruleAgeOn',domOn:'ruleDomOn',grpOn:'ruleGrpOn',
+            enabled:'ruleEnabled',err:'ruleErr',preview:'rulePreview',title:'ruleModalTitle' };
+  const el=k=>document.getElementById(F[k]);
+  const matchBox=document.getElementById('ruleMatch');
+  const getMatch=()=>{ const a=matchBox&&matchBox.querySelector('.rm-opt.active'); return a?a.dataset.v:'all'; };
+  const setMatch=v=>{ if(!matchBox) return; matchBox.querySelectorAll('.rm-opt').forEach(b=>b.classList.toggle('active', b.dataset.v===(v==='any'?'any':'all'))); };
+  // вкл/выкл строки условия → серость инпутов
+  const syncCondRow=(onKey,cond)=>{
+    const cb=el(onKey); if(!cb) return;
+    const row=matchBox && document.querySelector('.rule-cond-row[data-cond="'+cond+'"]');
+    if(row) row.classList.toggle('off', !cb.checked);
+  };
+
+  const loadGroups=()=>fetch('api.php?action=groups&table='+enc(A.table)).then(r=>r.json()).then(rows=>{ groups=rows||[]; });
+  const load=()=>fetch('api.php?action=rules_list&table='+enc(A.table)).then(r=>r.json()).then(res=>{
+    if(!res.ok) return;
+    rulesCache=res.rules||[];
+    const cu=document.getElementById('cronUrl'); if(cu) cu.textContent=res.cron_url||'';
+    renderList();
+    renderLog(res.log||[]);
+  });
+
+  function renderLog(log){
+    const wrap=document.getElementById('rulesLogWrap'), box=document.getElementById('rulesLog');
+    if(!wrap||!box) return;
+    if(!log.length){ wrap.style.display='none'; return; }
+    wrap.style.display='';
+    box.innerHTML=log.map(e=>{
+      const t=fmtWhen(e.time)||'';
+      const src=e.source==='cron'?'<span class="rl-src cron">cron</span>':'<span class="rl-src">вручную</span>';
+      let name, body;
+      if(e.kind==='run'){
+        name='Прогон';
+        body = 'правил '+(e.rules||0)+' · перенесено <b>'+(e.moved||0)+'</b>'+
+               (e.errors?' · <span class="rl-err">ошибок '+e.errors+'</span>':'');
+      } else {
+        name=esc(e.name||'(без имени)');
+        body = e.ok
+          ? ('перенесено <b>'+(e.moved!=null?e.moved:0)+'</b>')
+          : ('<span class="rl-err">ошибка: '+esc(e.error||'')+'</span>');
+      }
+      return '<div class="rl-row'+(e.ok?'':' bad')+'">'+
+        '<span class="rl-time">'+esc(t)+'</span>'+src+
+        '<span class="rl-name">'+name+'</span>'+
+        '<span class="rl-body">'+body+'</span>'+
+      '</div>';
+    }).join('');
+    refreshIcons();
+  }
+
+  const grpName=v=> v===''?'любая':(v==='__none__'?'без группы':v);
+  function condText(r){
+    const c=[];
+    const on=k=>(r[k]===undefined||r[k]); // флаг отсутствует → включено
+    if(on('age_on')&&(r.age_min!=null||r.age_max!=null)) c.push('возраст'+(r.age_min!=null?' от '+r.age_min:'')+(r.age_max!=null?' до '+r.age_max:'')+' дн');
+    if(on('dom_on')&&(r.dom_min!=null||r.dom_max!=null)) c.push('доменов'+(r.dom_min!=null?' от '+r.dom_min:'')+(r.dom_max!=null?' до '+r.dom_max:''));
+    if(on('grp_on')&&(r.grp_min!=null||r.grp_max!=null)) c.push('в группе'+(r.grp_min!=null?' от '+r.grp_min:'')+(r.grp_max!=null?' до '+r.grp_max:'')+' дн');
+    if(!c.length) return 'без условий (вся группа)';
+    return c.join(r.match==='any'?'  ИЛИ  ':'  И  ');
+  }
+  function fmtWhen(iso){ if(!iso) return null; try{ return new Date(iso).toLocaleString('ru-RU'); }catch(e){ return iso; } }
+
+  function renderList(){
+    if(!rulesCache.length){ listEl.innerHTML='<div class="rules-empty">Правил пока нет. Создайте первое — кнопка «Новое правило».</div>'; return; }
+    listEl.innerHTML=rulesCache.map(r=>{
+      const w=fmtWhen(r.last_run);
+      const last = w ? ('Запуск: '+w+(r.last_moved!=null?' · перенесено '+r.last_moved:'')) : 'Ещё не запускалось';
+      const errB = r.last_error ? '<span class="rule-errbadge" title="'+esc(r.last_error)+'">ошибка</span>' : '';
+      return '<div class="rule-card'+(r.enabled?'':' off')+'" data-id="'+esc(r.id)+'">'+
+        '<div class="rule-main">'+
+          '<div class="rule-top"><b>'+esc(r.name||'(без названия)')+'</b>'+errB+'</div>'+
+          '<div class="rule-flow"><span class="rg">'+esc(grpName(r.from_group))+'</span>'+svg('arrow-right')+'<span class="rg to">'+esc(r.to_group)+'</span></div>'+
+          '<div class="rule-cond-txt">'+esc(condText(r))+'</div>'+
+          '<div class="rule-last">'+esc(last)+'</div>'+
+        '</div>'+
+        '<div class="rule-actions">'+
+          '<label class="switch sm" title="Вкл/выкл"><input type="checkbox" class="r-en"'+(r.enabled?' checked':'')+'><span class="tr"></span></label>'+
+          '<button class="btn sm" data-act="run" title="Запустить сейчас">'+svg('play')+'</button>'+
+          '<button class="btn sm" data-act="edit" title="Изменить">'+svg('pencil')+'</button>'+
+          '<button class="btn sm danger" data-act="del" title="Удалить">'+svg('trash-2')+'</button>'+
+        '</div>'+
+      '</div>';
+    }).join('');
+    refreshIcons();
+  }
+
+  listEl.addEventListener('click',e=>{
+    const card=e.target.closest('.rule-card'); if(!card) return;
+    const r=rulesCache.find(x=>x.id===card.dataset.id); if(!r) return;
+    const btn=e.target.closest('[data-act]'); if(!btn) return;
+    const act=btn.dataset.act;
+    if(act==='edit') openModal(r);
+    else if(act==='del'){ if(confirm('Удалить правило «'+(r.name||'')+'»?')) del(r.id); }
+    else if(act==='run') runOne(r.id,btn);
+  });
+  listEl.addEventListener('change',e=>{
+    const cb=e.target.closest('.r-en'); if(!cb) return;
+    const card=e.target.closest('.rule-card');
+    const r=rulesCache.find(x=>x.id===card.dataset.id); if(!r) return;
+    r.enabled=cb.checked; save(r,true);
+  });
+
+  function fillSelects(fromVal,toVal){
+    const opt=(v,t,sel)=>'<option value="'+esc(v)+'"'+(String(v)===String(sel)?' selected':'')+'>'+esc(t)+'</option>';
+    let gs=groups.filter(g=>g.g && g.g!=='__none__').map(g=>({g:g.g,n:g.n}));
+    if(toVal && toVal!=='__new__' && !gs.some(g=>g.g===toVal)) gs=gs.concat([{g:toVal,n:0}]);
+    let fromOpts=opt('','любая группа',fromVal)+opt('__none__','без группы',fromVal);
+    if(fromVal && fromVal!=='__none__' && !gs.some(g=>g.g===fromVal)) fromOpts+=opt(fromVal,fromVal,fromVal);
+    el('from').innerHTML=fromOpts+gs.map(g=>opt(g.g,g.g+(g.n?' ('+g.n+')':''),fromVal)).join('');
+    el('to').innerHTML=gs.map(g=>opt(g.g,g.g,toVal)).join('')+opt('__new__','➕ Создать новую…',toVal);
+  }
+  function openModal(r){
+    el('err').className='err'; el('preview').textContent='';
+    el('id').value=r?r.id:'';
+    el('name').value=r?(r.name||''):'';
+    document.getElementById(F.title).textContent=r?'Изменить правило':'Новое правило';
+    fillSelects(r?r.from_group:'', r?r.to_group:'');
+    el('toNew').style.display='none'; el('toNew').value='';
+    el('ageMin').value=r&&r.age_min!=null?r.age_min:'';
+    el('ageMax').value=r&&r.age_max!=null?r.age_max:'';
+    el('domMin').value=r&&r.dom_min!=null?r.dom_min:'';
+    el('domMax').value=r&&r.dom_max!=null?r.dom_max:'';
+    if(el('grpMin')) el('grpMin').value=r&&r.grp_min!=null?r.grp_min:'';
+    if(el('grpMax')) el('grpMax').value=r&&r.grp_max!=null?r.grp_max:'';
+    el('enabled').checked=r?!!r.enabled:true;
+    // И/ИЛИ + флаги вкл условий (у старых правил флаг отсутствует → включено)
+    setMatch(r&&r.match==='any'?'any':'all');
+    if(el('ageOn')){ el('ageOn').checked = r ? (r.age_on!==false) : true; syncCondRow('ageOn','age'); }
+    if(el('domOn')){ el('domOn').checked = r ? (r.dom_on!==false) : true; syncCondRow('domOn','dom'); }
+    if(el('grpOn')){ el('grpOn').checked = r ? (r.grp_on!==false) : true; syncCondRow('grpOn','grp'); }
+    modal.classList.add('open'); refreshIcons(); preview();
+  }
+  const closeModal=()=>modal.classList.remove('open');
+  document.getElementById('ruleNew').addEventListener('click',()=>openModal(null));
+  document.getElementById('ruleCancel').addEventListener('click',closeModal);
+  modal.addEventListener('click',e=>{ if(e.target===modal) closeModal(); });
+  el('to').addEventListener('change',()=>{ const isNew=el('to').value==='__new__';
+    el('toNew').style.display=isNew?'':'none'; if(isNew) el('toNew').focus(); preview(); });
+
+  function ruleFromForm(){
+    let to=el('to').value; if(to==='__new__') to=el('toNew').value.trim();
+    return { id:el('id').value, name:el('name').value, enabled:el('enabled').checked?1:'',
+             from_group:el('from').value, to_group:to,
+             age_min:el('ageMin').value, age_max:el('ageMax').value,
+             dom_min:el('domMin').value, dom_max:el('domMax').value,
+             grp_min:el('grpMin')?el('grpMin').value:'', grp_max:el('grpMax')?el('grpMax').value:'',
+             match:getMatch(),
+             age_on:el('ageOn')&&el('ageOn').checked?1:'', dom_on:el('domOn')&&el('domOn').checked?1:'',
+             grp_on:el('grpOn')&&el('grpOn').checked?1:'' };
+  }
+  let pvTimer=null;
+  function preview(){
+    clearTimeout(pvTimer);
+    pvTimer=setTimeout(()=>{
+      const d=ruleFromForm();
+      if(!d.to_group){ el('preview').textContent=''; return; }
+      const p=new URLSearchParams(d);
+      fetch('api.php?action=rules_preview&table='+enc(A.table)+'&'+p.toString()).then(r=>r.json()).then(res=>{
+        if(res.ok && res.count!=null) el('preview').innerHTML='Под условие сейчас подпадает <b>'+res.count+'</b>';
+        else el('preview').textContent='';
+      }).catch(()=>{});
+    },300);
+  }
+  ['name','ageMin','ageMax','domMin','domMax','grpMin','grpMax','from','toNew'].forEach(k=>{
+    const e=el(k); if(e){ e.addEventListener('input',preview); e.addEventListener('change',preview); }
+  });
+  // переключатель И/ИЛИ
+  matchBox&&matchBox.querySelectorAll('.rm-opt').forEach(b=>b.addEventListener('click',()=>{ setMatch(b.dataset.v); preview(); }));
+  // чекбоксы вкл/выкл условий
+  [['ageOn','age'],['domOn','dom'],['grpOn','grp']].forEach(([k,c])=>{
+    const e=el(k); if(e) e.addEventListener('change',()=>{ syncCondRow(k,c); preview(); });
+  });
+
+  document.getElementById('ruleSave').addEventListener('click',()=>{
+    const d=ruleFromForm();
+    if(!d.to_group){ el('err').textContent='Выберите или создайте целевую группу'; el('err').className='err show'; return; }
+    const btn=document.getElementById('ruleSave'); btn.disabled=true;
+    const fd=new FormData(); Object.entries(d).forEach(([k,v])=>fd.append(k,v));
+    fetch('api.php?action=rules_save&table='+enc(A.table),{method:'POST',body:fd}).then(r=>r.json()).then(res=>{
+      if(res.ok){ toast('Правило сохранено'); closeModal(); loadGroups().then(load); }
+      else { el('err').textContent=res.error||'Ошибка'; el('err').className='err show'; }
+    }).catch(e=>{ el('err').textContent=String(e); el('err').className='err show'; }).finally(()=>btn.disabled=false);
+  });
+
+  function save(rule,silent){
+    const d={ id:rule.id,name:rule.name,enabled:rule.enabled?1:'',from_group:rule.from_group,to_group:rule.to_group,
+              age_min:rule.age_min??'',age_max:rule.age_max??'',dom_min:rule.dom_min??'',dom_max:rule.dom_max??'',
+              grp_min:rule.grp_min??'',grp_max:rule.grp_max??'',
+              match:rule.match||'all',
+              age_on:(rule.age_on===undefined||rule.age_on)?1:'',dom_on:(rule.dom_on===undefined||rule.dom_on)?1:'',grp_on:(rule.grp_on===undefined||rule.grp_on)?1:'' };
+    const fd=new FormData(); Object.entries(d).forEach(([k,v])=>fd.append(k,v));
+    fetch('api.php?action=rules_save&table='+enc(A.table),{method:'POST',body:fd}).then(r=>r.json()).then(res=>{
+      if(!silent){ if(res.ok) toast('Сохранено'); else toast(res.error||'Ошибка',false); }
+      load();
+    });
+  }
+  function del(id){
+    const fd=new FormData(); fd.append('id',id);
+    fetch('api.php?action=rules_delete&table='+enc(A.table),{method:'POST',body:fd}).then(r=>r.json()).then(res=>{
+      if(res.ok){ toast('Правило удалено'); load(); } else toast(res.error||'Ошибка',false);
+    });
+  }
+  function runOne(id,btn){
+    if(btn){ btn.classList.add('busy'); btn.disabled=true; }
+    const fd=new FormData(); fd.append('id',id);
+    fetch('api.php?action=rules_run&table='+enc(A.table),{method:'POST',body:fd}).then(r=>r.json()).then(res=>{
+      if(res.ok) toast('Перенесено: '+res.moved); else toast(res.error||'Ошибка',false);
+      load();
+    }).catch(e=>toast(String(e),false)).finally(()=>{ if(btn){ btn.classList.remove('busy'); btn.disabled=false; } });
+  }
+  document.getElementById('rulesRunAll').addEventListener('click',()=>{
+    const b=document.getElementById('rulesRunAll'); b.classList.add('busy'); b.disabled=true;
+    const fd=new FormData(); fd.append('all','1');
+    fetch('api.php?action=rules_run&table='+enc(A.table),{method:'POST',body:fd}).then(r=>r.json()).then(res=>{
+      if(res.ok) toast('Готово. Перенесено всего: '+res.moved_total); else toast(res.error||'Ошибка',false);
+      load();
+    }).catch(e=>toast(String(e),false)).finally(()=>{ b.classList.remove('busy'); b.disabled=false; });
+  });
+  const logClear=document.getElementById('rulesLogClear');
+  logClear&&logClear.addEventListener('click',()=>{
+    if(!confirm('Очистить журнал запусков?')) return;
+    fetch('api.php?action=rules_log_clear&table='+enc(A.table),{method:'POST',body:new FormData()})
+      .then(r=>r.json()).then(()=>load());
+  });
+
+  document.querySelectorAll('.rc-copy').forEach(b=>b.addEventListener('click',()=>{
+    const t=document.getElementById(b.dataset.copy); if(!t) return;
+    if(navigator.clipboard) navigator.clipboard.writeText(t.textContent).then(()=>toast('Скопировано')).catch(()=>{});
+  }));
+
+  loadGroups().then(load);
 }

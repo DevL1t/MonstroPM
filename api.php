@@ -2,6 +2,7 @@
 
 declare(strict_types=1);
 require __DIR__ . '/lib.php';
+require __DIR__ . '/rules.php';
 
 if (!config_exists()) { http_response_code(503); json_out(['error' => 'Панель не настроена']); }
 require_auth_api();
@@ -26,6 +27,17 @@ try
         case 'delete_bulk': delete_bulk($table); break;
         case 'set_group_bulk': set_group_bulk($table); break;
         case 'save_settings':  save_settings();        break;
+        case 'export':  export_data($table); break;
+        case 'import':  import_data($table); break;
+        case 'rules_list':    rules_list($table);    break;
+        case 'rules_save':    rules_save($table);    break;
+        case 'rules_delete':  rules_delete($table);  break;
+        case 'rules_run':     rules_run($table);     break;
+        case 'rules_preview': rules_preview($table); break;
+        case 'rules_log_clear': rules_log_clear($table); break;
+        case 'gtrack_status':  gtrack_status($table);  break;
+        case 'gtrack_enable':  gtrack_enable($table);  break;
+        case 'gtrack_disable': gtrack_disable($table); break;
         default:        http_response_code(400); json_out(['error' => 'unknown action']);
     }
 }
@@ -64,11 +76,39 @@ function build_filters(string $table, array &$where, array &$params): void
     {
         $where[] = qi('ismobiledevice') . ' = ' . ($dev === 'mobile' ? 'true' : 'false');
     }
-    $age = $_GET['f_age'] ?? '';
-    $ageMap = ['24h'=>'1 day','3d'=>'3 days','7d'=>'7 days','30d'=>'30 days'];
-    if (isset($ageMap[$age]) && in_array('data_create', $names, true))
+    # Возраст профиля в днях: диапазон от/до. Возраст = now - data_create.
+    # возраст >= min дней  ⟺  создан не позже чем min дней назад (data_create <= now - min)
+    # возраст <= max дней  ⟺  создан не раньше чем max дней назад (data_create >= now - max)
+    if (in_array('data_create', $names, true))
     {
-        $where[] = qi('data_create') . " > now() - interval '" . $ageMap[$age] . "'";
+        $aMin = $_GET['f_age_min'] ?? '';
+        $aMax = $_GET['f_age_max'] ?? '';
+        if ($aMin !== '' && ctype_digit((string)$aMin))
+            $where[] = qi('data_create') . " <= now() - interval '" . (int)$aMin . " days'";
+        if ($aMax !== '' && ctype_digit((string)$aMax))
+            $where[] = qi('data_create') . " >= now() - interval '" . (int)$aMax . " days'";
+    }
+
+    # Кол-во доменов: диапазон от/до
+    if (in_array('domaincount', $names, true))
+    {
+        $dMin = $_GET['f_dom_min'] ?? '';
+        $dMax = $_GET['f_dom_max'] ?? '';
+        if ($dMin !== '' && ctype_digit((string)$dMin))
+            $where[] = qi('domaincount') . ' >= ' . (int)$dMin;
+        if ($dMax !== '' && ctype_digit((string)$dMax))
+            $where[] = qi('domaincount') . ' <= ' . (int)$dMax;
+    }
+
+    # Дней в текущей группе (party_since ставит триггер БД при смене группы)
+    if (in_array('party_since', $names, true))
+    {
+        $gMin = $_GET['f_grp_min'] ?? '';
+        $gMax = $_GET['f_grp_max'] ?? '';
+        if ($gMin !== '' && ctype_digit((string)$gMin))
+            $where[] = qi('party_since') . " <= now() - interval '" . (int)$gMin . " days'";
+        if ($gMax !== '' && ctype_digit((string)$gMax))
+            $where[] = qi('party_since') . " >= now() - interval '" . (int)$gMax . " days'";
     }
     $act = $_GET['f_activity'] ?? '';
     if ($act !== '' && in_array('cookies_len', $names, true))
@@ -432,6 +472,27 @@ function delete_bulk(string $table): void
     $pk = get_pk($table);
     if (count($pk) !== 1) json_out(['ok'=>false,'error'=>'массовое удаление доступно только для таблицы с одиночным ключом']);
     $col = $pk[0];
+
+    # scope=filter — удалить ВСЕ записи по текущему фильтру (без перечисления ID, одним запросом)
+    if (($_POST['scope'] ?? '') === 'filter')
+    {
+        try
+        {
+            $where = []; $params = [];
+            build_filters($table, $where, $params);
+            $whereSql = $where ? (' WHERE ' . implode(' AND ', $where)) : '';
+            $st = db()->prepare("DELETE FROM " . qi($table) . $whereSql);
+            $st->execute($params);
+            json_out(['ok' => true, 'deleted' => $st->rowCount()]);
+        }
+        catch (Throwable $e)
+        {
+            log_err($e); http_response_code(422);
+            json_out(['ok' => false, 'error' => 'Не удалось удалить (детали в логе)']);
+        }
+        return;
+    }
+
     $ids = $_POST['ids'] ?? [];
     if (!is_array($ids) || !$ids) json_out(['ok'=>false,'error'=>'не выбрано ни одной записи']);
     $ids = array_values(array_unique(array_map('strval', $ids)));
@@ -459,11 +520,11 @@ function set_group_bulk(string $table): void
     if (count($pk) !== 1) json_out(['ok'=>false,'error'=>'операция доступна только для таблицы с одиночным ключом']);
     $col = group_col($table);
     if (!$col) json_out(['ok'=>false,'error'=>'колонка группы не настроена']);
-    $ids = $_POST['ids'] ?? [];
-    if (!is_array($ids) || !$ids) json_out(['ok'=>false,'error'=>'не выбрано ни одной записи']);
-    $ids = array_values(array_unique(array_map('strval', $ids)));
-    if (count($ids) > 5000) json_out(['ok'=>false,'error'=>'слишком много записей за один раз (макс. 5000)']);
-    $group = trim((string)($_POST['group'] ?? ''));
+
+    $scope = ($_POST['scope'] ?? '') === 'filter' ? 'filter' : 'ids';
+    # целевая группа — отдельный параметр to_group, чтобы не путать с фильтром group в build_filters
+    $group = trim((string)($_POST['to_group'] ?? ''));
+
     # ограничение длины по схеме колонки (если задано)
     foreach (get_columns($table) as $c)
     {
@@ -473,6 +534,33 @@ function set_group_bulk(string $table): void
             if (s_len($group) > $max) json_out(['ok'=>false,'error'=>"Название группы длиннее $max символов"]);
         }
     }
+
+    # scope=filter — перенести ВСЕ записи по текущему фильтру одним запросом
+    if ($scope === 'filter')
+    {
+        try
+        {
+            $where = []; $params = [];
+            build_filters($table, $where, $params);
+            $set = ($group === '') ? qi($col) . ' = NULL' : qi($col) . ' = :grp';
+            if ($group !== '') $params[':grp'] = $group;
+            $whereSql = $where ? (' WHERE ' . implode(' AND ', $where)) : '';
+            $st = db()->prepare("UPDATE " . qi($table) . " SET $set" . $whereSql);
+            $st->execute($params);
+            json_out(['ok' => true, 'updated' => $st->rowCount()]);
+        }
+        catch (Throwable $e)
+        {
+            log_err($e); http_response_code(422);
+            json_out(['ok' => false, 'error' => 'Не удалось сменить группу (детали в логе)']);
+        }
+        return;
+    }
+
+    $ids = $_POST['ids'] ?? [];
+    if (!is_array($ids) || !$ids) json_out(['ok'=>false,'error'=>'не выбрано ни одной записи']);
+    $ids = array_values(array_unique(array_map('strval', $ids)));
+    if (count($ids) > 5000) json_out(['ok'=>false,'error'=>'слишком много записей за один раз (макс. 5000)']);
     try
     {
         $ph = []; $params = [];
@@ -524,10 +612,454 @@ function save_settings(): void
     json_out(['ok'=>false, 'error'=>'Не удалось записать config.php — проверьте права на запись.']);
 }
 
+# Экспорт профилей — SQL-дамп или CSV, потоково (scope: all|filter|ids)
+function export_data(string $table): void
+{
+    $format = ($_GET['format'] ?? 'sql') === 'csv' ? 'csv' : 'sql';
+    $scope  = $_GET['scope'] ?? 'all';
+    $names  = column_names($table);
+    $pk     = get_pk($table);
+    $pdo    = db();
+
+    # bool-колонки выгружаем как true/false (PDO отдаёт их как '1'/'', а '' в bool не импортнётся)
+    $boolCols = [];
+    foreach (get_columns($table) as $c) if ($c['is_bool']) $boolCols[] = $c['column_name'];
+
+    # WHERE по охвату; значения инлайним безопасно — серверный курсор не принимает плейсхолдеры
+    $where = [];
+    if ($scope === 'filter')
+    {
+        $params = [];
+        build_filters($table, $where, $params);
+        $sql = $where ? implode(' AND ', $where) : '';
+        foreach ($params as $k => $v) $sql = str_replace($k, $pdo->quote((string)$v), $sql);
+        $where = $sql !== '' ? [$sql] : [];
+    }
+    elseif ($scope === 'ids')
+    {
+        $ids = array_values(array_unique(array_map('strval', (array)($_GET['ids'] ?? []))));
+        if ($pk && $ids)
+        {
+            $lst = array_map(fn($v) => ctype_digit($v) ? $v : $pdo->quote($v), $ids);
+            $where[] = qi($pk[0]) . ' IN (' . implode(',', $lst) . ')';
+        }
+        else $where[] = '1=0';
+    }
+    $whereSql = $where ? (' WHERE ' . implode(' AND ', $where)) : '';
+
+    @set_time_limit(0);
+    while (ob_get_level()) ob_end_clean();
+    $fname = $table . '_' . date('Ymd_His') . '.' . $format;
+    header('Content-Type: ' . ($format === 'csv' ? 'text/csv; charset=utf-8' : 'application/sql; charset=utf-8'));
+    header('Content-Disposition: attachment; filename="' . $fname . '"');
+
+    $selSql  = implode(', ', array_map('qi', $names));
+    $colList = '(' . implode(', ', array_map('qi', $names)) . ')';
+    $onConf  = $pk ? (' ON CONFLICT (' . qi($pk[0]) . ') DO NOTHING') : '';
+
+    $fp = null;
+    if ($format === 'sql')
+    {
+        echo "-- Monstro Profile Manager — экспорт «" . $table . "» (" . date('Y-m-d H:i') . ")\n\n";
+    }
+    else
+    {
+        $fp = fopen('php://output', 'w');
+        fputcsv($fp, $names);
+    }
+
+    # потоковая выгрузка курсором — тысячи тяжёлых строк нельзя держать в памяти
+    $pdo->beginTransaction();
+    $pdo->exec("DECLARE mpm_exp NO SCROLL CURSOR FOR SELECT $selSql FROM " . qi($table) . $whereSql);
+    while (true)
+    {
+        $rows = $pdo->query("FETCH 500 FROM mpm_exp")->fetchAll(PDO::FETCH_ASSOC);
+        if (!$rows) break;
+        if ($format === 'sql')
+        {
+            $vals = [];
+            foreach ($rows as $r)
+            {
+                $cells = [];
+                foreach ($names as $n)
+                {
+                    $v = $r[$n];
+                    if ($v === null) $cells[] = 'NULL';
+                    elseif (in_array($n, $boolCols, true)) $cells[] = ($v === '1' || $v === 't' || $v === true) ? 'true' : 'false';
+                    else $cells[] = $pdo->quote((string)$v);
+                }
+                $vals[] = '(' . implode(',', $cells) . ')';
+            }
+            echo "INSERT INTO " . qi($table) . " $colList VALUES\n" . implode(",\n", $vals) . $onConf . ";\n";
+        }
+        else
+        {
+            foreach ($rows as $r)
+            {
+                $line = [];
+                foreach ($names as $n)
+                {
+                    $v = $r[$n];
+                    if ($v !== null && in_array($n, $boolCols, true)) $v = ($v === '1' || $v === 't' || $v === true) ? 't' : 'f';
+                    $line[] = $v;
+                }
+                fputcsv($fp, $line);
+            }
+        }
+        flush();
+    }
+    $pdo->exec("CLOSE mpm_exp");
+    $pdo->commit();
+
+    # Футер дампа: после вставки явных PID секвенцию identity-ключа надо подтянуть
+    # к max(pk) на целевом сервере, иначе софт ловит конфликт PID при создании профилей.
+    if ($format === 'sql' && $pk)
+    {
+        $pkc = $pk[0];
+        echo "\n-- Синхронизация секвенции identity-ключа (без неё софт не создаст новые профили)\n";
+        echo "DO \$\$\nDECLARE s text;\nBEGIN\n"
+           . "  s := pg_get_serial_sequence(" . $pdo->quote($table) . ", " . $pdo->quote($pkc) . ");\n"
+           . "  IF s IS NOT NULL THEN\n"
+           . "    PERFORM setval(s, (SELECT COALESCE(MAX(" . qi($pkc) . "), 1) FROM " . qi($table) . "), true);\n"
+           . "  END IF;\nEND \$\$;\n";
+    }
+    exit;
+}
+
+# Импорт профилей из CSV (выгруженного панелью). mode: skip|overwrite|new
+function import_data(string $table): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); json_out(['error'=>'POST only']); }
+    $pk = get_pk($table);
+    if (count($pk) !== 1) json_out(['ok'=>false,'error'=>'импорт доступен только для таблицы с одиночным ключом']);
+
+    # пустые $_POST и $_FILES при ненулевом теле запроса = файл больше post_max_size (PHP молча отбросил)
+    if ((int)($_SERVER['CONTENT_LENGTH'] ?? 0) > 0 && !$_POST && !$_FILES)
+    {
+        json_out(['ok'=>false, 'error'=>'Файл больше post_max_size (' . ini_get('post_max_size')
+            . '). Поднимите лимиты в php.ini, импортируйте меньшими частями (по фильтру/выбранным) или залейте SQL-дамп через psql.']);
+    }
+    # понятные сообщения по кодам ошибок загрузки
+    $uerr = $_FILES['file']['error'] ?? UPLOAD_ERR_NO_FILE;
+    if (!isset($_FILES['file']) || $uerr !== UPLOAD_ERR_OK)
+    {
+        $msg = [
+            UPLOAD_ERR_INI_SIZE   => 'файл больше upload_max_filesize (' . ini_get('upload_max_filesize') . ') — поднимите лимит или импортируйте частями',
+            UPLOAD_ERR_FORM_SIZE  => 'файл слишком большой',
+            UPLOAD_ERR_PARTIAL    => 'файл загрузился частично — попробуйте ещё раз',
+            UPLOAD_ERR_NO_FILE    => 'файл не выбран',
+            UPLOAD_ERR_NO_TMP_DIR => 'нет временной папки для загрузки (настройка сервера)',
+            UPLOAD_ERR_CANT_WRITE => 'не удалось записать загруженный файл (права сервера)',
+        ];
+        json_out(['ok'=>false, 'error'=>$msg[$uerr] ?? 'файл не загружен']);
+    }
+    $mode  = in_array($_POST['mode'] ?? '', ['skip','overwrite','new'], true) ? $_POST['mode'] : 'skip';
+    $pkcol = $pk[0];
+    $cols  = column_names($table);
+
+    $fp = fopen($_FILES['file']['tmp_name'], 'r');
+    if (!$fp) json_out(['ok'=>false,'error'=>'не удалось прочитать файл']);
+    $header = fgetcsv($fp);
+    if (!$header) { fclose($fp); json_out(['ok'=>false,'error'=>'пустой CSV']); }
+
+    # позиция в строке → имя колонки (только существующие в таблице)
+    $useIdx = [];
+    foreach ($header as $i => $h) { $h = trim((string)$h); if (in_array($h, $cols, true)) $useIdx[$i] = $h; }
+    if (!$useIdx) { fclose($fp); json_out(['ok'=>false,'error'=>'в файле нет колонок, совпадающих с таблицей']); }
+
+    $nextId = ($mode === 'new')
+        ? (int)db()->query("SELECT COALESCE(MAX(" . qi($pkcol) . "),0)+1 FROM " . qi($table))->fetchColumn()
+        : null;
+
+    # Список вставляемых колонок фиксирован заголовком CSV (+ pk в режиме new)
+    $colList = array_values($useIdx);
+    if ($mode === 'new' && !in_array($pkcol, $colList, true)) $colList[] = $pkcol;
+
+    # ON CONFLICT собираем один раз
+    if ($mode === 'overwrite')
+    {
+        $upd = [];
+        foreach ($colList as $c) if ($c !== $pkcol) $upd[] = qi($c) . ' = EXCLUDED.' . qi($c);
+        $conflict = $upd ? ' ON CONFLICT (' . qi($pkcol) . ') DO UPDATE SET ' . implode(', ', $upd)
+                         : ' ON CONFLICT (' . qi($pkcol) . ') DO NOTHING';
+    }
+    else
+    {
+        $conflict = ' ON CONFLICT (' . qi($pkcol) . ') DO NOTHING';
+    }
+
+    $colSql = implode(', ', array_map('qi', $colList));
+    $insSql = "INSERT INTO " . qi($table) . " ($colSql) VALUES ";
+    $BATCH  = 200;
+
+    $imported = 0; $skipped = 0; $bad = 0;
+    $pdo = db();
+    $pdo->beginTransaction();
+    try
+    {
+        $buf = []; # накопленные строки (массивы значений в порядке $colList)
+
+        # Сброс пакета одним многострочным INSERT
+        $flush = function() use (&$buf, &$imported, &$skipped, $pdo, $insSql, $colList, $conflict)
+        {
+            if (!$buf) return;
+            $groups = []; $params = []; $n = 0;
+            foreach ($buf as $vals)
+            {
+                $phs = [];
+                foreach ($colList as $j => $c) { $k = ':v' . $n . '_' . $j; $phs[] = $k; $params[$k] = $vals[$j]; }
+                $groups[] = '(' . implode(', ', $phs) . ')';
+                $n++;
+            }
+            $st = $pdo->prepare($insSql . implode(', ', $groups) . $conflict);
+            $st->execute($params);
+            $aff = $st->rowCount();
+            $imported += $aff;
+            $skipped  += count($buf) - $aff;
+            $buf = [];
+        };
+
+        while (($row = fgetcsv($fp)) !== false)
+        {
+            if (count($row) === 1 && ($row[0] === null || $row[0] === '')) continue;
+            $data = [];
+            foreach ($useIdx as $i => $name) { $v = $row[$i] ?? null; $data[$name] = ($v === '') ? null : $v; }
+
+            if ($mode === 'new') $data[$pkcol] = $nextId++;
+            elseif (!isset($data[$pkcol]) || $data[$pkcol] === null) { $bad++; continue; }
+
+            $vals = [];
+            foreach ($colList as $c) $vals[] = $data[$c] ?? null;
+            $buf[] = $vals;
+
+            if (count($buf) >= $BATCH) $flush();
+        }
+        $flush();
+        $pdo->commit();
+    }
+    catch (Throwable $e)
+    {
+        $pdo->rollBack();
+        log_err($e);
+        fclose($fp);
+        json_out(['ok'=>false,'error'=>'Ошибка импорта (детали в логе)']);
+    }
+    fclose($fp);
+
+    # Синхронизируем секвенцию identity/serial-ключа с max(pk).
+    # Иначе при вставке явных PID Postgres не двигает секвенцию,
+    # и софт (Monstro) ловит конфликт PID при создании новых профилей.
+    $seqSynced = false;
+    try
+    {
+        $seq = $pdo->query("SELECT pg_get_serial_sequence(" . $pdo->quote($table) . ", " . $pdo->quote($pkcol) . ")")->fetchColumn();
+        if ($seq)
+        {
+            $pdo->query("SELECT setval(" . $pdo->quote($seq) . ", (SELECT COALESCE(MAX(" . qi($pkcol) . "), 1) FROM " . qi($table) . "), true)");
+            $seqSynced = true;
+        }
+    }
+    catch (Throwable $e) { log_err($e); }
+
+    json_out(['ok'=>true, 'imported'=>$imported, 'skipped'=>$skipped, 'bad'=>$bad, 'mode'=>$mode, 'seq_synced'=>$seqSynced]);
+}
+
 # Имя колонки-группы из конфига
 function group_col(string $table): ?string
 {
     return cfg()['app']['group_column'] ?? null;
+}
+
+# Планировщик: список правил + данные для UI (ключ крона, базовый URL)
+function rules_list(string $table): void
+{
+    $store = rules_store();
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+    $host   = $_SERVER['HTTP_HOST'] ?? 'localhost';
+    $dir    = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '/')), '/');
+    json_out([
+        'ok'       => true,
+        'rules'    => $store['rules'],
+        'log'      => array_slice($store['log'] ?? [], 0, 100),
+        'cron_key' => rules_cron_key(),
+        'cron_url' => "$scheme://$host$dir/cron.php?key=" . rules_cron_key(),
+    ]);
+}
+
+# Планировщик: создать/обновить правило (upsert по id)
+function rules_save(string $table): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); json_out(['error'=>'POST only']); }
+    $rule = rule_sanitize($_POST);
+    if ($rule['to_group'] === '') json_out(['ok'=>false,'error'=>'Укажите целевую группу']);
+    if ($rule['name'] === '') $rule['name'] = ($rule['from_group'] !== '' ? $rule['from_group'] : 'любая') . ' → ' . $rule['to_group'];
+
+    $store = rules_store();
+    $found = false;
+    foreach ($store['rules'] as &$r)
+    {
+        if (($r['id'] ?? '') === $rule['id'])
+        {
+            # сохраняем историю прогона при редактировании
+            $rule['last_run']   = $r['last_run']   ?? null;
+            $rule['last_moved'] = $r['last_moved'] ?? null;
+            $rule['created_at'] = $r['created_at'] ?? $rule['created_at'];
+            $r = $rule; $found = true; break;
+        }
+    }
+    unset($r);
+    if (!$found) $store['rules'][] = $rule;
+    if (!rules_write($store)) json_out(['ok'=>false,'error'=>'Не удалось сохранить (нет прав на запись rules.json?)']);
+    json_out(['ok'=>true, 'rule'=>$rule]);
+}
+
+# Планировщик: удалить правило по id
+function rules_delete(string $table): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); json_out(['error'=>'POST only']); }
+    $id = (string)($_POST['id'] ?? '');
+    $store = rules_store();
+    $before = count($store['rules']);
+    $store['rules'] = array_values(array_filter($store['rules'], fn($r) => ($r['id'] ?? '') !== $id));
+    if (count($store['rules']) === $before) json_out(['ok'=>false,'error'=>'правило не найдено']);
+    if (!rules_write($store)) json_out(['ok'=>false,'error'=>'Не удалось сохранить']);
+    json_out(['ok'=>true]);
+}
+
+# Планировщик: запустить одно правило (id) или все (all=1) вручную
+function rules_run(string $table): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); json_out(['error'=>'POST only']); }
+    if (!empty($_POST['all']))
+    {
+        $summary = rules_run_all('manual');
+        $total = array_sum(array_map(fn($s) => $s['moved'] ?? 0, $summary));
+        json_out(['ok'=>true, 'moved_total'=>$total, 'details'=>$summary]);
+    }
+    $id = (string)($_POST['id'] ?? '');
+    $store = rules_store();
+    foreach ($store['rules'] as &$r)
+    {
+        if (($r['id'] ?? '') === $id)
+        {
+            try
+            {
+                $n = rule_apply(db(), $table, $r);
+                $r['last_run'] = date('c'); $r['last_moved'] = $n; $r['last_error'] = null;
+                rules_log_push($store, ['time'=>date('c'),'kind'=>'rule','name'=>$r['name'],'moved'=>$n,'source'=>'manual','ok'=>true]);
+                rules_write($store);
+                json_out(['ok'=>true, 'moved'=>$n]);
+            }
+            catch (Throwable $e)
+            {
+                log_err($e);
+                $r['last_run'] = date('c'); $r['last_error'] = $e->getMessage();
+                rules_log_push($store, ['time'=>date('c'),'kind'=>'rule','name'=>$r['name'],'source'=>'manual','ok'=>false,'error'=>$e->getMessage()]);
+                rules_write($store);
+                json_out(['ok'=>false, 'error'=>$e->getMessage()]);
+            }
+        }
+    }
+    unset($r);
+    json_out(['ok'=>false, 'error'=>'правило не найдено']);
+}
+
+# Планировщик: очистить журнал запусков
+function rules_log_clear(string $table): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); json_out(['error'=>'POST only']); }
+    $store = rules_store();
+    $store['log'] = [];
+    rules_write($store);
+    json_out(['ok'=>true]);
+}
+
+# Отслеживание групп: проверка наличия колонки party_since и триггера в БД
+function gtrack_status(string $table): void
+{
+    try
+    {
+        $pdo = db();
+        $c = $pdo->prepare("SELECT 1 FROM information_schema.columns WHERE table_name = ? AND column_name = 'party_since'");
+        $c->execute([$table]);
+        $hasCol = (bool)$c->fetchColumn();
+        $hasTrg = (bool)$pdo->query("SELECT 1 FROM pg_trigger WHERE tgname = 'mpm_party_since_trg' AND NOT tgisinternal")->fetchColumn();
+        json_out(['ok'=>true, 'column'=>$hasCol, 'trigger'=>$hasTrg, 'enabled'=>($hasCol && $hasTrg)]);
+    }
+    catch (Throwable $e) { log_err($e); json_out(['ok'=>false, 'error'=>$e->getMessage()]); }
+}
+
+# Отслеживание групп: включить (колонка + бэкфилл + триггер). Безопасно для Monstro.
+function gtrack_enable(string $table): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); json_out(['error'=>'POST only']); }
+    $g = group_col($table);
+    if (!$g) json_out(['ok'=>false, 'error'=>'колонка группы не настроена']);
+    $names = column_names($table);
+    if (!in_array($g, $names, true)) json_out(['ok'=>false, 'error'=>"в таблице нет колонки группы «$g»"]);
+    $backfill = in_array('data_create', $names, true) ? qi('data_create') : 'now()';
+    $t  = qi($table);
+    $gc = qi($g);
+    try
+    {
+        $pdo = db();
+        $pdo->exec("ALTER TABLE $t ADD COLUMN IF NOT EXISTS party_since timestamptz");
+        $pdo->exec("UPDATE $t SET party_since = $backfill WHERE party_since IS NULL");
+        # триггер следит за колонкой группы; EXECUTE PROCEDURE — совместимо со старыми PG
+        $pdo->exec(
+            "CREATE OR REPLACE FUNCTION mpm_party_since() RETURNS trigger AS \$mpm\$\n" .
+            "BEGIN\n" .
+            "  IF TG_OP = 'INSERT' THEN\n" .
+            "    IF NEW.party_since IS NULL THEN NEW.party_since := now(); END IF;\n" .
+            "  ELSIF NEW.$gc IS DISTINCT FROM OLD.$gc THEN\n" .
+            "    NEW.party_since := now();\n" .
+            "  END IF;\n" .
+            "  RETURN NEW;\n" .
+            "END;\n\$mpm\$ LANGUAGE plpgsql"
+        );
+        $pdo->exec("DROP TRIGGER IF EXISTS mpm_party_since_trg ON $t");
+        $pdo->exec("CREATE TRIGGER mpm_party_since_trg BEFORE INSERT OR UPDATE ON $t FOR EACH ROW EXECUTE PROCEDURE mpm_party_since()");
+        schema_flush();  # чтобы новая колонка сразу появилась в фильтрах/правилах
+        json_out(['ok'=>true]);
+    }
+    catch (Throwable $e)
+    {
+        log_err($e);
+        json_out(['ok'=>false, 'error'=>'Не удалось включить: ' . $e->getMessage()]);
+    }
+}
+
+# Отслеживание групп: отключить (снимаем триггер, функцию и колонку — полностью)
+function gtrack_disable(string $table): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); json_out(['error'=>'POST only']); }
+    $t = qi($table);
+    try
+    {
+        $pdo = db();
+        $pdo->exec("DROP TRIGGER IF EXISTS mpm_party_since_trg ON $t");
+        $pdo->exec("DROP FUNCTION IF EXISTS mpm_party_since()");
+        $pdo->exec("ALTER TABLE $t DROP COLUMN IF EXISTS party_since");
+        schema_flush();
+        json_out(['ok'=>true]);
+    }
+    catch (Throwable $e) { log_err($e); json_out(['ok'=>false, 'error'=>$e->getMessage()]); }
+}
+
+# Планировщик: сколько профилей подпадёт под условия (живой предпросмотр в форме)
+function rules_preview(string $table): void
+{
+    try
+    {
+        $rule = rule_sanitize($_REQUEST);
+        if ($rule['to_group'] === '') { json_out(['ok'=>true, 'count'=>null]); }
+        $n = rule_count(db(), $table, $rule);
+        json_out(['ok'=>true, 'count'=>$n]);
+    }
+    catch (Throwable $e)
+    {
+        json_out(['ok'=>false, 'error'=>$e->getMessage()]);
+    }
 }
 
 # WHERE по первичному ключу из параметров запроса

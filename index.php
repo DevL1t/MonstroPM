@@ -10,12 +10,15 @@ require_auth_page();
 
 if (!isset($_GET['page'])) { header('Location: index.php?page=profiles'); exit; }
 
-$page = in_array($_GET['page'], ['dashboard', 'profiles', 'settings'], true) ? $_GET['page'] : 'profiles';
+$page = in_array($_GET['page'], ['dashboard', 'profiles', 'rules', 'settings'], true) ? $_GET['page'] : 'profiles';
 $table = cfg()['app']['table'];
 $appTitle = APP_NAME;
 
 # Проверяем БД заранее (до вывода), чтобы при сбое показать аккуратную ошибку, а не падать посреди вёрстки
 $dbErr = !db_ok();
+
+# Включено ли отслеживание времени в группе (опциональная миграция party_since)
+$hasGroupTracking = !$dbErr && in_array('party_since', column_names($table), true);
 
 $colMeta = []; $pk = []; $groupCol = null;
 if ($page === 'profiles' && !$dbErr)
@@ -26,7 +29,7 @@ if ($page === 'profiles' && !$dbErr)
 
     # колонки, видимые по умолчанию (остальные — через «Колонки»)
     $showDefault = ['pid','data_create','party','platform','platform_version','browser','browser_version',
-        'fingerprints','cookies','proxy','last_date_work','date_block','last_visit_sites','last_task',
+        'folder','fingerprints','cookies','proxy','last_date_work','date_block','last_visit_sites','last_task',
         'domaincount','warm'];
 
     # поля, доступные в форме (остальные — авто/системные)
@@ -80,6 +83,7 @@ function ico(string $n){ return '<svg class="ic" data-lucide="'.$n.'"></svg>'; }
       <a href="?page=profiles" class="<?= $page==='profiles'?'active':'' ?>"><?= ico('users') ?> Профили
 <?php if (!$dbErr): ?><span class="cnt"><?= number_format(table_count($table),0,'',' ') ?></span><?php endif; ?>
       </a>
+      <a href="?page=rules" class="<?= $page==='rules'?'active':'' ?>"><?= ico('calendar-clock') ?> Планировщик</a>
     </nav>
 
     <?php
@@ -151,6 +155,30 @@ function ico(string $n){ return '<svg class="ic" data-lucide="'.$n.'"></svg>'; }
       chartBox('chCreated',   'trending-up', "Создано профилей ($cdays дней)", 12);
       ?>
     </div>
+  <?php elseif ($page === 'rules'): ?>
+    <div class="topbar">
+      <h1><?= ico('calendar-clock') ?> Планировщик</h1>
+      <div class="topbar-actions">
+        <button class="btn" id="rulesRunAll"><?= ico('play') ?> Запустить все</button>
+        <button class="btn primary" id="ruleNew"><?= ico('plus') ?> Новое правило</button>
+      </div>
+    </div>
+    <div class="panel rules-cron" id="rulesCron">
+      <div class="rc-head"><?= ico('clock') ?> <b>Автозапуск</b> — повесьте обработчик на крон (раз в час):</div>
+      <div class="rc-row"><span class="rc-lbl">CLI (cron):</span><code id="cronCli">php <?= htmlspecialchars(__DIR__) ?>/cron.php</code><button class="rc-copy" data-copy="cronCli"><?= ico('copy') ?></button></div>
+      <div class="rc-row"><span class="rc-lbl">HTTP:</span><code id="cronUrl">…</code><button class="rc-copy" data-copy="cronUrl"><?= ico('copy') ?></button></div>
+      <div class="rc-hint">Правила применяются по порядку. Профиль, уже состоящий в целевой группе, не трогается.</div>
+    </div>
+    <div class="rules-list" id="rulesList"><div class="rules-empty">Загрузка…</div></div>
+
+    <div class="rules-log-wrap" id="rulesLogWrap" style="display:none">
+      <div class="rules-log-head">
+        <span><?= ico('clock') ?> Журнал запусков</span>
+        <button class="rl-clear" id="rulesLogClear"><?= ico('trash-2') ?> очистить</button>
+      </div>
+      <div class="rules-log" id="rulesLog"></div>
+    </div>
+
   <?php elseif ($page === 'settings'):
     $a = cfg()['app']; $db = cfg()['db'];
     $val = fn($x) => htmlspecialchars((string)$x);
@@ -210,11 +238,30 @@ function ico(string $n){ return '<svg class="ic" data-lucide="'.$n.'"></svg>'; }
         </div>
       </form>
     </div>
+
+    <?php if (!$dbErr): ?>
+    <div class="panel" style="padding:22px;margin-top:16px">
+      <div class="setup-sec" style="border-top:0;padding-top:0"><?= ico('users') ?> Отслеживание времени в группе</div>
+      <p class="confirm-text" style="margin:0 0 14px;line-height:1.55">
+        Включает условие <b>«Дней в группе»</b> в фильтрах и планировщике — например, возвращать профиль из SURF в WARM через 3 дня.
+        В таблицу <code>profiles</code> добавляется колонка <code>party_since</code> и триггер БД, который сам проставляет время при смене группы (кем бы она ни менялась — Monstro, скрипты, панель). Для Monstro безопасно.
+      </p>
+      <div class="gtrack" id="gtrack" data-enabled="<?= $hasGroupTracking ? '1' : '0' ?>">
+        <span class="gtrack-badge <?= $hasGroupTracking ? 'on' : 'off' ?>" id="gtrackStatus"><?= $hasGroupTracking ? 'включено' : 'выключено' ?></span>
+        <button class="btn <?= $hasGroupTracking ? '' : 'primary' ?>" id="gtrackToggle"><?= $hasGroupTracking ? ico('x') . ' Отключить' : ico('check') . ' Включить' ?></button>
+        <span class="err" id="gtrackErr"></span>
+      </div>
+    </div>
+    <?php endif; ?>
   <?php else: ?>
     <div class="topbar">
       <h1><?= ico('users') ?> Профили</h1>
       <span class="spacer"></span>
-      <?php if ($pk): ?><button class="btn primary" id="addBtn"><?= ico('plus') ?> Добавить</button><?php endif; ?>
+      <?php if ($pk): ?>
+      <button class="btn" id="exportBtn"><?= ico('download') ?> Экспорт</button>
+      <button class="btn" id="importBtn"><?= ico('upload') ?> Импорт</button>
+      <button class="btn primary" id="addBtn"><?= ico('plus') ?> Добавить</button>
+      <?php endif; ?>
     </div>
 
     <?php if ($groupCol): ?>
@@ -234,13 +281,26 @@ function ico(string $n){ return '<svg class="ic" data-lucide="'.$n.'"></svg>'; }
           <option value="mobile">📱 Мобильные</option>
           <option value="desktop">🖥 Десктоп</option>
         </select>
-        <select class="sel" id="fAge">
-          <option value="">Возраст: любой</option>
-          <option value="24h">&lt; 24 часов</option>
-          <option value="3d">&lt; 3 дней</option>
-          <option value="7d">&lt; 7 дней</option>
-          <option value="30d">&lt; 30 дней</option>
-        </select>
+        <div class="sel age-range" title="Возраст профиля в днях (now − дата создания)">
+          <span class="age-lbl"><?= ico('clock') ?> Возраст, дней:</span>
+          <input type="number" min="0" step="1" id="fAgeMin" class="age-in" placeholder="от" inputmode="numeric">
+          <span class="age-dash">–</span>
+          <input type="number" min="0" step="1" id="fAgeMax" class="age-in" placeholder="до" inputmode="numeric">
+        </div>
+        <div class="sel age-range" title="Количество доменов в профиле">
+          <span class="age-lbl"><?= ico('globe') ?> Доменов:</span>
+          <input type="number" min="0" step="1" id="fDomMin" class="age-in" placeholder="от" inputmode="numeric">
+          <span class="age-dash">–</span>
+          <input type="number" min="0" step="1" id="fDomMax" class="age-in" placeholder="до" inputmode="numeric">
+        </div>
+<?php if ($hasGroupTracking): ?>
+        <div class="sel age-range" title="Сколько дней профиль в текущей группе">
+          <span class="age-lbl"><?= ico('users') ?> В группе, дней:</span>
+          <input type="number" min="0" step="1" id="fGrpMin" class="age-in" placeholder="от" inputmode="numeric">
+          <span class="age-dash">–</span>
+          <input type="number" min="0" step="1" id="fGrpMax" class="age-in" placeholder="до" inputmode="numeric">
+        </div>
+<?php endif; ?>
         <select class="sel" id="fActivity">
           <option value="">Активность: любая</option>
           <option value="fresh">Без активности (0 cookies)</option>
@@ -257,6 +317,7 @@ function ico(string $n){ return '<svg class="ic" data-lucide="'.$n.'"></svg>'; }
     <?php if ($bulk): ?>
     <div class="bulkbar" id="bulkbar">
       <span class="bulk-info"><?= ico('check-square') ?> Выбрано: <b id="bulkCount">0</b></span>
+      <a class="bulk-alllink" id="bulkAllLink" style="display:none"></a>
       <span class="spacer"></span>
       <?php if ($groupCol): ?>
       <div class="bulk-group">
@@ -306,6 +367,108 @@ function ico(string $n){ return '<svg class="ic" data-lucide="'.$n.'"></svg>'; }
   <div class="actions">
     <button type="button" class="btn" id="confirmNo"><?= ico('x') ?> Отмена</button>
     <button type="button" class="btn danger" id="confirmYes"><?= ico('trash-2') ?> Удалить</button>
+  </div>
+</div></div>
+
+<!-- модалка экспорта -->
+<div class="modal" id="exportModal"><div class="box sm">
+  <h2><?= ico('download') ?> Экспорт профилей</h2>
+  <div class="exp-group">
+    <div class="exp-lbl">Формат</div>
+    <label class="exp-opt"><input type="radio" name="exp_format" value="sql" checked> SQL-дамп <span class="exp-hint">— в любую PostgreSQL (psql/pgAdmin)</span></label>
+    <label class="exp-opt"><input type="radio" name="exp_format" value="csv"> CSV <span class="exp-hint">— Excel или импорт в панель</span></label>
+  </div>
+  <div class="exp-group">
+    <div class="exp-lbl">Что выгрузить</div>
+    <label class="exp-opt"><input type="radio" name="exp_scope" value="all" checked> Все профили</label>
+    <label class="exp-opt"><input type="radio" name="exp_scope" value="filter"> По текущему фильтру</label>
+    <label class="exp-opt"><input type="radio" name="exp_scope" value="ids"> Только выбранные <span class="exp-hint" id="expSelCnt"></span></label>
+  </div>
+  <div class="actions">
+    <button type="button" class="btn" id="exportCancel"><?= ico('x') ?> Отмена</button>
+    <button type="button" class="btn primary" id="exportGo"><?= ico('download') ?> Скачать</button>
+  </div>
+</div></div>
+
+<!-- модалка импорта -->
+<div class="modal" id="importModal"><div class="box sm">
+  <h2><?= ico('upload') ?> Импорт профилей</h2>
+  <p class="confirm-text">Загрузите CSV, выгруженный этой панелью. Колонки сопоставляются по имени, лишние игнорируются.</p>
+  <div class="exp-group"><input type="file" id="importFile" accept=".csv,text/csv"></div>
+  <div class="exp-group">
+    <div class="exp-lbl">Если PID уже есть в базе</div>
+    <label class="exp-opt"><input type="radio" name="imp_mode" value="skip" checked> Пропустить дубликаты</label>
+    <label class="exp-opt"><input type="radio" name="imp_mode" value="overwrite"> Перезаписать</label>
+    <label class="exp-opt"><input type="radio" name="imp_mode" value="new"> Вставить с новым PID</label>
+  </div>
+  <div class="err" id="importErr"></div>
+  <div class="imp-prog" id="importProg">
+    <div class="imp-prog-head"><span id="importProgLbl">Загрузка…</span><span id="importProgPct">0%</span></div>
+    <div class="imp-bar"><i id="importBar"></i></div>
+  </div>
+  <div class="actions">
+    <button type="button" class="btn" id="importCancel"><?= ico('x') ?> Отмена</button>
+    <button type="button" class="btn primary" id="importGo"><?= ico('upload') ?> Импортировать</button>
+  </div>
+</div></div>
+
+<!-- модалка правила планировщика -->
+<div class="modal" id="ruleModal"><div class="box rule-box">
+  <h2><?= ico('calendar-clock') ?> <span id="ruleModalTitle">Новое правило</span></h2>
+  <input type="hidden" id="ruleId">
+  <div class="exp-group">
+    <div class="exp-lbl">Название (необязательно)</div>
+    <input type="text" class="finput" id="ruleName" maxlength="80" placeholder="напр. Прогрев NEW → WARM">
+  </div>
+  <div class="rule-grid">
+    <div class="exp-group">
+      <div class="exp-lbl">Из группы</div>
+      <select class="finput" id="ruleFrom"></select>
+    </div>
+    <div class="exp-group">
+      <div class="exp-lbl">В группу</div>
+      <select class="finput" id="ruleTo"></select>
+      <input type="text" class="finput" id="ruleToNew" placeholder="название новой группы" style="display:none;margin-top:8px" maxlength="64">
+    </div>
+  </div>
+  <div class="rule-cond-head">
+    <span class="exp-lbl" style="margin:0">Условия</span>
+    <div class="rule-match" id="ruleMatch">
+      <button type="button" class="rm-opt active" data-v="all">Все (И)</button>
+      <button type="button" class="rm-opt" data-v="any">Любое (ИЛИ)</button>
+    </div>
+  </div>
+  <div class="rule-cond">
+    <div class="rule-cond-row" data-cond="age">
+      <label class="rc-chk"><input type="checkbox" id="ruleAgeOn" checked></label>
+      <span class="rc-name"><?= ico('clock') ?> Возраст, дней</span>
+      <input type="number" min="0" step="1" id="ruleAgeMin" class="age-in" placeholder="от" inputmode="numeric">
+      <span class="age-dash">–</span>
+      <input type="number" min="0" step="1" id="ruleAgeMax" class="age-in" placeholder="до" inputmode="numeric">
+    </div>
+    <div class="rule-cond-row" data-cond="dom">
+      <label class="rc-chk"><input type="checkbox" id="ruleDomOn" checked></label>
+      <span class="rc-name"><?= ico('globe') ?> Доменов</span>
+      <input type="number" min="0" step="1" id="ruleDomMin" class="age-in" placeholder="от" inputmode="numeric">
+      <span class="age-dash">–</span>
+      <input type="number" min="0" step="1" id="ruleDomMax" class="age-in" placeholder="до" inputmode="numeric">
+    </div>
+<?php if ($hasGroupTracking): ?>
+    <div class="rule-cond-row" data-cond="grp">
+      <label class="rc-chk"><input type="checkbox" id="ruleGrpOn" checked></label>
+      <span class="rc-name"><?= ico('users') ?> Дней в группе</span>
+      <input type="number" min="0" step="1" id="ruleGrpMin" class="age-in" placeholder="от" inputmode="numeric">
+      <span class="age-dash">–</span>
+      <input type="number" min="0" step="1" id="ruleGrpMax" class="age-in" placeholder="до" inputmode="numeric">
+    </div>
+<?php endif; ?>
+  </div>
+  <label class="rule-enable"><span class="switch"><input type="checkbox" id="ruleEnabled" checked><span class="tr"></span></span> Правило включено (участвует в автозапуске)</label>
+  <div class="rule-preview" id="rulePreview"></div>
+  <div class="err" id="ruleErr"></div>
+  <div class="actions">
+    <button type="button" class="btn" id="ruleCancel"><?= ico('x') ?> Отмена</button>
+    <button type="button" class="btn primary" id="ruleSave"><?= ico('check') ?> Сохранить</button>
   </div>
 </div></div>
 

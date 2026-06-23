@@ -2,6 +2,10 @@
 config.php
 config.php.tmp
 
+# правила планировщика + ключ крона — пользовательские данные
+rules.json
+rules.json.tmp
+
 # логи, временное, дампы
 *.log
 /backups/
