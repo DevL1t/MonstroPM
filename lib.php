@@ -5,7 +5,7 @@
 declare(strict_types=1);
 
 const APP_NAME    = 'Monstro Profile Manager';   # имя продукта — фиксированное, не настройка
-const APP_VERSION = '1.2.0';                     # версия — свойство кода, не конфига (меняется при релизе)
+const APP_VERSION = '1.3.0';                     # версия — свойство кода, не конфига (меняется при релизе)
 
 # Полифил array_is_list() для PHP 8.0
 if (!function_exists('array_is_list'))

@@ -38,6 +38,8 @@ try
         case 'gtrack_status':  gtrack_status($table);  break;
         case 'gtrack_enable':  gtrack_enable($table);  break;
         case 'gtrack_disable': gtrack_disable($table); break;
+        case 'db_conns':     db_conns();     break;
+        case 'db_kill_idle': db_kill_idle();  break;
         default:        http_response_code(400); json_out(['error' => 'unknown action']);
     }
 }
@@ -972,6 +974,50 @@ function rules_log_clear(string $table): void
     $store['log'] = [];
     rules_write($store);
     json_out(['ok'=>true]);
+}
+
+# Монитор соединений PostgreSQL: занято/лимит/idle/active
+function db_conns(): void
+{
+    try
+    {
+        $pdo  = db();
+        $max  = (int)$pdo->query("SELECT setting FROM pg_settings WHERE name='max_connections'")->fetchColumn();
+        $resv = (int)$pdo->query("SELECT setting FROM pg_settings WHERE name='superuser_reserved_connections'")->fetchColumn();
+        $rows = $pdo->query("SELECT COALESCE(state,'?') st, count(*) n FROM pg_stat_activity GROUP BY 1")->fetchAll(PDO::FETCH_KEY_PAIR);
+        $used = array_sum($rows);
+        json_out([
+            'ok'     => true,
+            'max'    => $max,
+            'usable' => max(0, $max - $resv),
+            'used'   => $used,
+            'free'   => max(0, $max - $resv - $used),
+            'idle'   => (int)($rows['idle'] ?? 0),
+            'active' => (int)($rows['active'] ?? 0),
+            'idle_tx'=> (int)($rows['idle in transaction'] ?? 0),
+        ]);
+    }
+    catch (Throwable $e) { json_out(['ok'=>false, 'error'=>'нет соединения с БД (возможно, слоты заняты): ' . $e->getMessage()]); }
+}
+
+# Сброс простаивающих (idle) соединений старше 2 минут — освобождает слоты
+function db_kill_idle(): void
+{
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); json_out(['error'=>'POST only']); }
+    try
+    {
+        $pdo = db();
+        # бьём только idle (не в транзакции, не active) и не себя
+        $n = (int)$pdo->query(
+            "SELECT count(*) FROM (
+               SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+               WHERE state = 'idle' AND pid <> pg_backend_pid()
+                 AND state_change < now() - interval '2 minutes'
+             ) x"
+        )->fetchColumn();
+        json_out(['ok'=>true, 'killed'=>$n]);
+    }
+    catch (Throwable $e) { json_out(['ok'=>false, 'error'=>$e->getMessage()]); }
 }
 
 # Отслеживание групп: проверка наличия колонки party_since и триггера в БД

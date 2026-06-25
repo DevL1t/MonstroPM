@@ -114,6 +114,17 @@ function ico(string $n){ return '<svg class="ic" data-lucide="'.$n.'"></svg>'; }
       <a href="?logout=1"><?= ico('log-out') ?> Выйти</a>
     </nav>
 
+    <?php if (!$dbErr): ?>
+    <div class="db-mini" id="dbMini" title="Слоты подключений PostgreSQL">
+      <div class="db-mini-row">
+        <?= ico('database') ?>
+        <span id="dbMiniTxt" title="Обновить">БД …</span>
+        <button class="db-mini-kill" id="dbMiniKill" title="Сбросить простаивающие (idle)"><?= ico('trash-2') ?> сброс</button>
+      </div>
+      <div class="db-mini-bar"><i id="dbMiniBar"></i></div>
+    </div>
+    <?php endif; ?>
+
     <div class="side-foot">
       <div class="credit">Powered by <a href="https://profitweb.net/@litwin/" target="_blank" rel="noopener">LITWIN</a></div>
       <div class="ver"><?= htmlspecialchars(APP_NAME) ?> v<?= htmlspecialchars(APP_VERSION) ?> · © <?= date('Y') ?></div>
@@ -252,6 +263,7 @@ function ico(string $n){ return '<svg class="ic" data-lucide="'.$n.'"></svg>'; }
         <span class="err" id="gtrackErr"></span>
       </div>
     </div>
+
     <?php endif; ?>
   <?php else: ?>
     <div class="topbar">

@@ -775,7 +775,7 @@ function renderCharts(s){
 
 /* ---------------- boot ---------------- */
 document.addEventListener('DOMContentLoaded', ()=>{
-  refreshIcons(); setupMenu();
+  refreshIcons(); setupMenu(); initDbMini();
   if(A.dbErr && A.page!=='settings') return;   // БД недоступна — показана карточка ошибки, инициализировать нечего
   if(A.page==='dashboard') initDashboard();
   else if(A.page==='settings') initSettings();
@@ -815,6 +815,72 @@ function initSettings(){
         }).catch(e=>{ err.textContent=String(e); err.className='err show'; gt.disabled=false; gt.classList.remove('busy'); });
     });
   }
+
+}
+
+/* ---------------- мини-монитор соединений БД (сайдбар, на всех страницах) ---------------- */
+function initDbMini(){
+  const wrap=document.getElementById('dbMini'); if(!wrap) return;
+  const txt=document.getElementById('dbMiniTxt');
+  const bar=document.getElementById('dbMiniBar');
+  const kill=document.getElementById('dbMiniKill');
+  let cur=0, raf=0, flick=0, first=true;
+
+  // анимация ожидания: числа крутятся, полоса «дышит»
+  const startLoading=()=>{
+    cancelAnimationFrame(raf);
+    bar.classList.add('loading');
+    let n=0;
+    clearInterval(flick);
+    flick=setInterval(()=>{ n=(n+3)%100; txt.textContent='БД '+n+'/100'; }, 50);
+  };
+  // остановить ожидание, зафиксировав текущую ширину полосы для плавного доезда
+  const stopLoading=()=>{
+    clearInterval(flick); flick=0;
+    if(bar.classList.contains('loading')){
+      const w=getComputedStyle(bar).width;
+      bar.style.transition='none'; bar.style.width=w;
+      bar.classList.remove('loading'); void bar.offsetWidth; bar.style.transition='';
+    }
+  };
+  // плавный «докрут» числа от текущего к target
+  const countTo=(to,max)=>{
+    cancelAnimationFrame(raf);
+    const from=cur, t0=performance.now(), dur=700;
+    const step=now=>{
+      const p=Math.min(1,(now-t0)/dur), e=1-Math.pow(1-p,3); // easeOutCubic
+      const v=Math.round(from+(to-from)*e);
+      txt.textContent='БД '+v+'/'+max;
+      if(p<1) raf=requestAnimationFrame(step); else { txt.textContent='БД '+to+'/'+max; cur=to; }
+    };
+    raf=requestAnimationFrame(step);
+  };
+
+  const load=()=>{
+    if(first) startLoading();   // полная анимация только при первой загрузке
+    return fetch('api.php?action=db_conns').then(r=>r.json()).then(d=>{
+      if(first){ stopLoading(); first=false; }
+      if(!d.ok){ cancelAnimationFrame(raf); txt.textContent='БД —'; bar.style.width='0'; bar.className=''; wrap.title='Нет соединения с БД'; cur=0; return; }
+      const pct=d.max?Math.round(d.used/d.max*100):0;
+      bar.className=pct>=90?'crit':(pct>=70?'warn':'');
+      bar.style.width=pct+'%';      // плавно доезжает к реальному значению
+      countTo(d.used,d.max);        // число красиво докручивается
+      wrap.title='Слоты PostgreSQL: занято '+d.used+' из '+d.max+' · idle '+d.idle+' · активных '+d.active;
+    }).catch(()=>{ stopLoading(); first=false; cancelAnimationFrame(raf); txt.textContent='БД —'; bar.style.width='0'; cur=0; });
+  };
+
+  txt&&txt.addEventListener('click',load);  // клик по тексту — обновить
+  kill&&kill.addEventListener('click',e=>{
+    e.stopPropagation();
+    if(!confirm('Сбросить простаивающие (idle) соединения старше 2 минут?')) return;
+    kill.disabled=true;
+    fetch('api.php?action=db_kill_idle',{method:'POST',body:new FormData()}).then(r=>r.json()).then(d=>{
+      if(d.ok) toast('Сброшено idle: '+d.killed); else toast(d.error||'Ошибка',false);
+      load();
+    }).catch(err=>toast(String(err),false)).finally(()=>kill.disabled=false);
+  });
+  load();
+  setInterval(load, 30000);  // авто-обновление раз в 30с
 }
 
 /* ---------------- планировщик ---------------- */
