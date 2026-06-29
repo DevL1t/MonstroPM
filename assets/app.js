@@ -775,7 +775,7 @@ function renderCharts(s){
 
 /* ---------------- boot ---------------- */
 document.addEventListener('DOMContentLoaded', ()=>{
-  refreshIcons(); setupMenu(); initDbMini();
+  refreshIcons(); setupMenu(); initDbMini(); initUpdate();
   if(A.dbErr && A.page!=='settings') return;   // БД недоступна — показана карточка ошибки, инициализировать нечего
   if(A.page==='dashboard') initDashboard();
   else if(A.page==='settings') initSettings();
@@ -816,6 +816,29 @@ function initSettings(){
     });
   }
 
+}
+
+/* ---------------- автообновление (баннер «доступна новая версия») ---------------- */
+function initUpdate(){
+  const banner=document.getElementById('updBanner'); if(!banner) return;
+  fetch('api.php?action=update_check').then(r=>r.json()).then(d=>{
+    if(d && d.ok && d.update && d.latest){
+      document.getElementById('updVer').textContent=d.latest;
+      banner.style.display='';
+      refreshIcons();
+    }
+  }).catch(()=>{});
+  const apply=document.getElementById('updApply');
+  apply&&apply.addEventListener('click',function(){
+    if(!confirm('Обновить MonstroPM до последней версии с GitHub?\n\nФайлы кода будут перезаписаны. config.php и rules.json не тронутся, перед обновлением создаётся бэкап в /backups/.')) return;
+    apply.disabled=true; apply.classList.add('busy');
+    fetch('api.php?action=update_apply',{method:'POST',body:new FormData()}).then(r=>r.json()).then(d=>{
+      if(d.ok){ toast('Обновлено файлов: '+d.count+'. Перезагрузка…'); setTimeout(()=>location.reload(true),1300); }
+      else { toast(d.error||'Ошибка обновления',false); apply.disabled=false; apply.classList.remove('busy'); }
+    }).catch(e=>{ toast(String(e),false); apply.disabled=false; apply.classList.remove('busy'); });
+  });
+  const close=document.getElementById('updClose');
+  close&&close.addEventListener('click',()=>banner.style.display='none');
 }
 
 /* ---------------- мини-монитор соединений БД (сайдбар, на всех страницах) ---------------- */

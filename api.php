@@ -3,6 +3,7 @@
 declare(strict_types=1);
 require __DIR__ . '/lib.php';
 require __DIR__ . '/rules.php';
+require __DIR__ . '/update.php';
 
 if (!config_exists()) { http_response_code(503); json_out(['error' => 'Панель не настроена']); }
 require_auth_api();
@@ -40,6 +41,11 @@ try
         case 'gtrack_disable': gtrack_disable($table); break;
         case 'db_conns':     db_conns();     break;
         case 'db_kill_idle': db_kill_idle();  break;
+        case 'update_check': json_out(['ok'=>true] + upd_status(!empty($_GET['force']))); break;
+        case 'update_apply':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); json_out(['ok'=>false,'error'=>'POST only']); }
+            json_out(upd_apply());
+            break;
         default:        http_response_code(400); json_out(['error' => 'unknown action']);
     }
 }

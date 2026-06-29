@@ -547,6 +547,19 @@ table.dataTable tbody td{text-align:center!important}
   padding:9px 15px;border-radius:10px;letter-spacing:.3px}
 .gtrack-badge.on{color:#8fd6a0;background:rgba(120,200,140,.12);border:1px solid rgba(120,200,140,.4)}
 .gtrack-badge.off{color:var(--mut2);background:var(--bg2);border:1px solid var(--line2)}
+/* баннер автообновления */
+.upd-banner{display:flex;align-items:center;gap:10px;margin-bottom:18px;padding:11px 16px;border-radius:12px;
+  background:linear-gradient(90deg,rgba(86,124,255,.16),rgba(56,189,248,.06));border:1px solid var(--acc);
+  font-size:14px;color:var(--txt);animation:pop .2s ease}
+.upd-banner .ic{width:17px;height:17px;color:var(--acc)}
+.upd-msg{display:flex;align-items:center;gap:8px}
+.upd-msg b{color:var(--acc)}
+.upd-cur{color:var(--mut2);font-size:12.5px}
+.upd-banner .btn.sm{padding:7px 13px;font-size:13px}
+.upd-close{background:none;border:0;color:var(--mut2);cursor:pointer;padding:4px;border-radius:7px;display:flex}
+.upd-close:hover{color:var(--txt)}
+.upd-close .ic{width:15px;height:15px}
+
 /* мини-монитор соединений БД в сайдбаре */
 .db-mini{margin:8px 0 0;padding:9px 10px;border:1px solid var(--line);border-radius:11px;background:var(--bg2)}
 .db-mini-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-bottom:7px}

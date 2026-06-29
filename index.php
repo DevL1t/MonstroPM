@@ -132,6 +132,12 @@ function ico(string $n){ return '<svg class="ic" data-lucide="'.$n.'"></svg>'; }
   </aside>
 
   <main class="main">
+    <div class="upd-banner" id="updBanner" style="display:none">
+      <span class="upd-msg"><?= ico('download') ?> Доступна новая версия <b id="updVer"></b> <span class="upd-cur">(у вас <?= htmlspecialchars(APP_VERSION) ?>)</span></span>
+      <span class="spacer"></span>
+      <button type="button" class="btn primary sm" id="updApply"><?= ico('download') ?> Обновить</button>
+      <button type="button" class="upd-close" id="updClose" title="Скрыть"><?= ico('x') ?></button>
+    </div>
   <?php if ($dbErr && $page !== 'settings'): ?>
     <div class="db-down">
       <?= ico('database') ?>
